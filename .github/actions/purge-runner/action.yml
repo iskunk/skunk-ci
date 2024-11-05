@@ -1,0 +1,24 @@
+---
+name: Purge runner
+description: Delete unnecessary files on the runner to free up space
+
+runs:
+  using: composite
+  steps:
+
+    - name: Expurgation
+      shell: bash
+      run: |
+        echo Before:
+        df -m .
+        sudo rm -rf \
+          /usr/local/.ghcup \
+          /usr/local/lib/android \
+          /usr/local/share/powershell \
+          /usr/share/dotnet \
+          /usr/share/swift \
+          "$AGENT_TOOLSDIRECTORY"
+        echo After:
+        df -m .
+
+# EOF
