@@ -1,0 +1,68 @@
+name: Build container image
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        type: boolean
+        description: "Upload to registry"
+        default: false
+
+env:
+  # used in oci/Makefile
+  APT_MIRROR: debian-archive.trafficmanager.net
+  IMAGE_SOURCE: ${{github.server_url}}/${{github.repository}}
+
+jobs:
+  main:
+    runs-on: ubuntu-26.04
+    permissions:
+      # needed to upload container images
+      packages: write
+    steps:
+
+      - name: Clone repository
+        uses: actions/checkout@v7
+
+      - name: Build container image
+        run: |
+          cd oci
+          make build \
+            APT_MIRROR=$APT_MIRROR \
+            REG_UID=$(id -u) \
+            IMAGE_SOURCE=$IMAGE_SOURCE
+
+      - name: Get date-based version tag for image
+        id: version
+        run: |
+          vtag=$(date '+%Y%m%d')
+          echo "Image version tag: $vtag"
+          echo "tag=$vtag" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.upload
+        env:
+          GITHUB_ACTOR: ${{github.actor}}
+          GITHUB_TOKEN: ${{github.token}}
+        run: docker login ghcr.io --username $GITHUB_ACTOR --password-stdin <<< $GITHUB_TOKEN
+
+      # Note: Ensure that the GitHub repo has at least "Role: Write"
+      # access to the container under "build-env -> Package settings ->
+      # Manage Actions access", or else the "docker push" operation
+      # will fail.
+
+      - name: Upload container image to registry
+        if: inputs.upload
+        env:
+          REMOTE_NAME: ghcr.io/${{github.repository_owner}}/build-env
+          IMAGE_TAG: ${{steps.version.outputs.tag}}
+        run: |
+          set -x
+          docker tag build-env $REMOTE_NAME:$IMAGE_TAG
+          docker tag build-env $REMOTE_NAME:latest
+          docker push $REMOTE_NAME:$IMAGE_TAG
+          docker push $REMOTE_NAME:latest
+          echo "Uploaded image: \`$REMOTE_NAME:$IMAGE_TAG\` (and updated \`:latest\`)" >> $GITHUB_STEP_SUMMARY
+          docker logout ghcr.io
+
+# end build-image.yml
