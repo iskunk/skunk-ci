@@ -1,0 +1,361 @@
+---
+name: XtraDeb package CI
+
+on:
+  workflow_call:
+    inputs:
+      origin:
+        type: string
+      package:
+        type: string
+      version:
+        type: string
+        required: false
+      script:
+        type: string
+        required: false
+      script-rev:
+        type: string
+        required: false
+      max-time:
+        type: number
+        default: 30
+  workflow_dispatch:
+    inputs:
+      origin:
+        # See util/apt-get-source.sh for valid origin IDs
+        type: string
+        description: Origin ID of package
+      package:
+        type: string
+        description: Name of package
+      version:
+        type: string
+        description: Package version (may be optional)
+        required: false
+      script:
+        type: string
+        description: Name of conversion script to use
+        required: false
+      script-rev:
+        type: string
+        description: Use this (Git) revision of xtradeb-convert
+        required: false
+      max-time:
+        type: number
+        description: Maximum test build duration (minutes)
+        default: 10
+
+jobs:
+
+  prep-source:
+    runs-on: ubuntu-24.04
+    env:
+      ARG_ORIGIN: ${{inputs.origin}}
+      ARG_PACKAGE: ${{inputs.package}}
+      ARG_VERSION: ${{inputs.version}}
+      ARG_SCRIPT: ${{inputs.script || 'generic'}}
+      ARG_SCRIPT_REV: ${{inputs.script-rev}}
+      ARG_MAX_TIME: ${{inputs.max-time}}
+    outputs:
+      test-matrix: ${{steps.convert.outputs.test-matrix}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Validate workflow args
+        run: util/validate-args.sh
+
+
+
+      - name: XXX temporary
+        run: |
+          mirror_list=$(cat <<END
+          ftp.us.debian.org
+          atl.mirrors.clouvider.net
+          debian-archive.trafficmanager.net
+          debian.cc.lehigh.edu
+          debian.csail.mit.edu
+          debian.cs.binghamton.edu
+          debian.mirror.constant.com
+          debian.osuosl.org
+          debian.uchicago.edu
+          la.mirrors.clouvider.net
+          lethe.chinstrap.org
+          mirror.0x626b.com
+          mirror.cogentco.com
+          mirror.dal.nexril.net
+          mirror.keystealth.org
+          mirror.rustytel.net
+          mirrors.accretive-networks.net
+          mirrors.bloomu.edu
+          mirrors.bmcc.edu
+          mirror.siena.edu
+          mirrors.iu13.net
+          mirrors.lug.mtu.edu
+          mirrors.ocf.berkeley.edu
+          mirror.steadfast.net
+          mirrors.vcea.wsu.edu
+          mirrors.wikimedia.org
+          mirrors.xtom.com
+          mirror.timkevin.us
+          mirror.us.leaseweb.net
+          mirror.us.mirhosting.net
+          mirror.us.oneandone.net
+          nyc.mirrors.clouvider.net
+          plug-mirror.rcac.purdue.edu
+          repo.ialab.dsu.edu
+          us.mirror.ahrefs.org
+          END
+          )
+          for m in $mirror_list; do
+            mtr -n -c 20 -C $m > mtr.out || true
+            n=$(wc -l < mtr.out)
+            printf '%d\t%s\n' $n $m
+          done
+          false
+
+
+      - name: Install required packages
+        run: |
+          exec 2>&1; set -x
+          sudo apt-get -y --no-install-recommends install \
+            cdbs \
+            debian-archive-keyring \
+            debian-keyring \
+            devscripts \
+            libdistro-info-perl
+
+      - name: Patch dpkg to speed up source package builds
+        run: (cd / && sudo patch -p1) < misc/dpkg-source-build.patch 2>&1
+
+      - name: Download xtradeb-convert
+        env:
+          ARG_SCRIPT_REV: ${{inputs.script-rev}}
+        run: |
+          exec 2>&1
+          rev=main
+          test -z "$ARG_SCRIPT_REV" || rev=$ARG_SCRIPT_REV
+          url=https://bitbucket.org/xtradeb/xtradeb-convert/get/$rev.tar.gz
+          tarball=/tmp/xtradeb-convert.tar.gz
+          (set -x; wget -O $tarball $url)
+          mkdir xtradeb-convert
+          (cd xtradeb-convert; set -x; tar xzf $tarball --strip-components=1)
+          echo ' '
+          (set -x; ls -l xtradeb-convert/pkg/$ARG_SCRIPT.sh)
+
+      - name: Download and unpack source package (common case)
+        if: inputs.origin != 'special'
+        run: |
+          exec 2>&1
+          echo "Origin: \`$ARG_ORIGIN\`" >> $GITHUB_STEP_SUMMARY
+          echo "Package: \`$ARG_PACKAGE\`" >> $GITHUB_STEP_SUMMARY
+          mkdir source
+          cd source
+          (set -x; ../util/apt-get-source.sh $ARG_ORIGIN $ARG_PACKAGE $ARG_VERSION)
+          echo ' '
+          (set -x; dpkg-source --skip-patches --extract *.dsc)
+          echo ' '
+          (set -x; dpkg-parsechangelog -l */debian/changelog -c 1)
+          version=$(dpkg-parsechangelog -l */debian/changelog -S Version)
+          echo "Version: \`$version\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Prepare special source download
+        if: inputs.origin == 'special'
+        id: special
+        run: util/special-get-source.sh --prepare $ARG_PACKAGE $ARG_VERSION
+
+      - name: Restore download cache (special case)
+        if: inputs.origin == 'special' && steps.special.outputs.cache-version
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: upstream-${{inputs.package}}-${{steps.special.outputs.cache-version}}
+          path: upstream
+
+      - name: Download and unpack sources (special case)
+        if: inputs.origin == 'special'
+        run: util/special-get-source.sh $ARG_PACKAGE $ARG_VERSION
+
+      - name: Save download cache (special case)
+        if: inputs.origin == 'special' && steps.special.outputs.cache-version && ! steps.restore-cache.outputs.cache-matched-key
+        uses: actions/cache/save@v4
+        with:
+          key: upstream-${{inputs.package}}-${{steps.special.outputs.cache-version}}
+          path: upstream
+          ## Needed to allow restoring cache inside container
+          #enableCrossOsArchive: true
+
+      - name: Convert source and create source packages
+        id: convert
+        env:
+          # Warning: May contain CRs
+          CODENAME_LIST: ${{vars.UBUNTU_CODENAME_LIST}}
+        run: |
+          exec 2>&1
+          cd source
+          srcpkg_dir=$(dirname $(echo */debian))
+          cp -a $srcpkg_dir/debian debian.orig
+          for codename in $(tr -d '\r' <<< $CODENAME_LIST)
+          do
+            echo "::group::Create source package for $codename"
+            rm -rf $srcpkg_dir/debian
+            cp -a debian.orig $srcpkg_dir/debian
+            rc=0
+            (set -x; ../xtradeb-convert/pkg/$ARG_SCRIPT.sh $srcpkg_dir/debian $codename) || rc=$?
+            case $rc in
+              0)
+              echo ' '
+              (set -x; dpkg-parsechangelog -l $srcpkg_dir/debian/changelog -c 1)
+              echo ' '
+              (set -x; dpkg-source --no-preparation --no-generate-diff --build $srcpkg_dir)
+              echo "$codename=ubuntu:$codename" >> test-matrix.txt
+              ls -1tr *.dsc | tail -n1 > dsc-file.$codename.txt
+              ;;
+              2) ;;  # not applicable/needed for this release
+              3) ;;  # not supported on this release
+              *) exit $rc ;;
+            esac
+            echo '::endgroup::'
+          done
+          rm -rf debian.orig $srcpkg_dir
+          # E.g. matrix =
+          #   [
+          #     {"codename": "jammy", "image": "ubuntu:jammy"},
+          #     {"codename": "noble", "image": "ubuntu:noble"},
+          #     ...
+          #   ]
+          matrix=$(jq -Rn --indent 0 '[ inputs | split("="; "") | {"codename": .[0], "image": .[1]} ]' test-matrix.txt)
+          echo "test-matrix=$matrix" >> $GITHUB_OUTPUT
+          # Keep a copy of this so we don't need to clone x-c again
+          cp -p $GITHUB_WORKSPACE/xtradeb-convert/util/can-install.sh .
+
+      - name: Upload source packages for test builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-packages
+          compression-level: 0
+          retention-days: 1
+          path: source
+
+  test-build:
+    needs: [prep-source]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        spec: ${{fromJSON(needs.prep-source.outputs.test-matrix)}}
+    container:
+      image: ${{matrix.spec.image}}
+      options: -v /:/HOST
+    env:
+      CODENAME: ${{matrix.spec.codename}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Free up some working space
+        run: util/purge-runner.sh
+
+      - name: Update APT config
+        run: |
+          cat > /etc/apt/apt.conf.d/95custom << END
+          # Don't install recommended packages
+          APT::Install-Recommends "0";
+          # Don't use "Reading database ... X%" progress indicator
+          Dpkg::Use-Pty "false";
+          END
+          perl -pi \
+            -e '/^(deb|URIs:)/ or next;' \
+            -e 's/(archive|security).ubuntu.com/azure.archive.ubuntu.com/;' \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources
+          sed "s/@SUITE@/$CODENAME/" misc/xtradeb-deps.sources.in > /etc/apt/sources.list.d/xtradeb-deps.sources
+
+      - name: Install required packages
+        # TODO: drop fakeroot
+        run: |
+          exec 2>&1; set -x
+          apt-get update --error-on=any
+          apt-get -y --no-install-recommends install devscripts dpkg-dev equivs zstd  fakeroot
+
+      - name: Download artifact with source packages
+        uses: actions/download-artifact@v4
+        with:
+          name: source-packages
+          path: source
+
+      - name: Create normal user to run the build
+        run: |
+          util/run-as-user.sh
+          chown -R build:users source
+
+      - name: Unpack appropriate source package
+        run: |
+          exec 2>&1
+          cd source
+          dsc_file=$(cat dsc-file.$CODENAME.txt)
+          echo ' '
+          ../util/run-as-user.sh "dpkg-source --extract $dsc_file"
+
+      - name: Install build dependencies
+        run: |
+          exec 2>&1
+          conf=/tmp/apt-yes.conf
+          (echo 'APT::Get::Assume-Yes "true";'; echo 'Dpkg::Use-Pty "false";') > $conf
+          set -x
+          APT_CONFIG=$conf mk-build-deps -ir source/*/debian/control
+
+      - name: Perform test build
+        id: build
+        env:
+          TIMEOUT: timeout --foreground --verbose --kill-after=30s ${{inputs.max-time}}m
+        run: |
+          exec 2>&1
+          cd source/*/debian/..
+          rc=0
+          ../../util/run-as-user.sh "$TIMEOUT dpkg-buildpackage -b" || rc=$?
+          sleep 5
+          echo ================================================================
+          if [ $rc -eq 124 ]
+          then
+            echo 'Partial build result is GOOD'
+            echo completed= >> $GITHUB_OUTPUT
+          elif [ $rc -eq 0 ]
+          then
+            echo 'Build completed successfully'
+            echo completed=true >> $GITHUB_OUTPUT
+          else
+            echo "Build FAILED with status $rc"
+            exit $rc
+          fi
+
+      - name: Check package installability
+        if: ${{steps.build.outputs.completed}}
+        run: |
+          cd source
+          chmod +x can-install.sh
+          ../util/run-as-user.sh "UBUNTU_APT_URL=http://azure.archive.ubuntu.com/ubuntu ./can-install.sh $CODENAME ./*.deb"
+
+  notify-salsa:
+    needs: [test-build]
+    if: inputs.salsa-ref
+    runs-on: ubuntu-latest
+    env:
+      #XXX#SALSA_REF: ${{inputs.salsa-ref}}
+      TOKEN: ${{secrets.SALSA_CHROMIUM_TOKEN}}
+    steps:
+      - name: Send notification to Salsa chromium repo
+        run: |
+          project_id=84400  # iskunk/chromium-debian
+          echo Doing curl request  # XXX
+          true curl --fail-with-body \
+            --request POST \
+            --form token=$TOKEN \
+            --form ref=master \
+            --form "variables[BASE_REF]=$SALSA_REF" \
+            https://salsa.debian.org/api/v4/projects/$project_id/trigger/pipeline
+
+# end package.yml
