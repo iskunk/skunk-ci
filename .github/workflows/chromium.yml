@@ -1,0 +1,221 @@
+---
+name: Chromium
+
+on:
+  workflow_dispatch:
+    inputs:
+      salsa-ref:
+        type: string
+        description: Salsa chromium repo tag/branch
+        required: false
+      test-build-time:
+        type: number
+        description: Test build length (minutes)
+        default: 30
+
+jobs:
+
+  prep-source:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-build: ${{steps.dpkg-source.outputs.matrix}}
+      version: ${{steps.salsa.outputs.version}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Clone Salsa Git repository and get the Chromium version
+        id: salsa
+        run: |
+          git clone https://salsa.debian.org/iskunk/chromium-debian.git
+          (cd chromium-debian
+           git config merge.dpkg-mergechangelogs.name   'debian/changelog merge driver'
+           git config merge.dpkg-mergechangelogs.driver 'dpkg-mergechangelogs -m %O %A %B %A'
+           echo 'debian/changelog merge=dpkg-mergechangelogs' >> .git/info/attributes
+           git show --no-patch | sed 's/^$/ /'
+          )
+          echo
+          pkg_version=$(cd chromium-debian && dpkg-parsechangelog -S Version)
+          version=${pkg_version%-*}
+          echo "Chromium version: $version"
+          echo version=$version >> $GITHUB_OUTPUT
+          echo " Package version: $pkg_version"
+
+      - name: Install required packages
+        run: sudo apt-get -y --no-install-recommends install devscripts libdistro-info-perl
+
+      - name: Perform automatic merges
+        env:
+          DEBFULLNAME: GitHub Action
+          DEBEMAIL: noreply@github.com
+          SALSA_REF: ${{inputs.salsa-ref}}
+        run: |
+          test -z "$SALSA_REF" || export MULTI_RELEASE_FROM_OVERRIDE=$SALSA_REF
+          cd chromium-debian
+          git config user.name  "$DEBFULLNAME"
+          git config user.email "$DEBEMAIL"
+          (set -x; ../util/multi-release.sh 'origin/ubuntu/*') 2>&1
+
+      - name: Restore download cache
+        id: restore-orig
+        uses: actions/cache/restore@v4
+        with:
+          key: chromium-orig-${{steps.salsa.outputs.version}}
+          path: orig
+
+      - name: Free up disk space on the runner
+        if: ${{ ! steps.restore-orig.outputs.cache-matched-key}}
+        uses: iskunk/skunk-ci/.github/actions/purge-runner@main
+
+      - name: Produce Debian orig source tarball
+        if: ${{ ! steps.restore-orig.outputs.cache-matched-key}}
+        run: |
+          echo 'progress = dot:giga' > ~/.wgetrc
+          (set -x; cd chromium-debian && debian/rules get-orig-source) 2>&1
+          for hash in md5sum sha1sum sha256sum
+          do
+            echo "$hash:"
+            $hash *.orig.tar.*
+          done
+          mkdir orig
+          mv -v *.orig.tar.* orig/
+          (set -x; ls -al orig) 2>&1
+
+      - name: Save download cache
+        if: ${{ ! steps.restore-orig.outputs.cache-matched-key}}
+        uses: actions/cache/save@v4
+        with:
+          key: chromium-orig-${{steps.salsa.outputs.version}}
+          path: orig
+          # Needed to allow restoring cache inside container
+          enableCrossOsArchive: true
+
+      - name: Patch dpkg to speed up source package builds
+        run: (cd / && sudo patch -p1) < misc/dpkg-source-build.patch
+
+      - name: Build source packages
+        id: dpkg-source
+        run: |
+          ln -s orig/*.orig.tar.* .
+          for branch in $(cat chromium-debian/branch-list)
+          do
+            echo ' '
+            (cd chromium-debian && git switch $branch)
+            (set -x; dpkg-source --no-preparation --no-generate-diff --build chromium-debian) 2>&1
+          done
+          # TODO: generate dynamically
+          echo 'matrix=[{"codename": "jammy", "image": "ubuntu:jammy"}, {"codename": "noble", "image": "ubuntu:noble"}, {"codename": "oracular", "image": "ubuntu:oracular"}]' >> $GITHUB_OUTPUT
+
+      - name: Upload artifact with source packages for test build(s)
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-packages
+          compression-level: 0
+          retention-days: 8
+          path: |
+            *.dsc
+            *.debian.tar.*
+
+  test-build:
+    needs: [prep-source]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{fromJSON(needs.prep-source.outputs.matrix-build)}}
+    container:
+      image: ${{matrix.build.image}}
+      options: -v /:/HOST
+    env:
+      CODENAME: ${{matrix.build.codename}}
+    steps:
+
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Update APT config
+        run: |
+          perl -pi \
+            -e '/^deb/ or next;' \
+            -e 's/archive.ubuntu.com/azure.archive.ubuntu.com/;' \
+            -e '/security.ubuntu.com/ and s/^/##/;' \
+            /etc/apt/sources.list \
+            /etc/apt/sources.list.d/ubuntu.sources
+          case "$CODENAME" in
+            jammy)
+            sed "s/@SUITE@/$CODENAME/" misc/xtradeb-deps.sources.in > /etc/apt/sources.list.d/xtradeb-deps.sources
+            ;;
+          esac
+
+      - name: Install required packages
+        run: |
+          apt-get update --error-on=any
+          apt-get -y --no-install-recommends install devscripts dpkg-dev equivs zstd
+
+      - name: Restore download cache
+        uses: actions/cache/restore@v4
+        with:
+          key: chromium-orig-${{needs.prep-source.outputs.version}}
+          path: orig
+          fail-on-cache-miss: true
+
+      - name: Download artifact with source packages
+        uses: actions/download-artifact@v4
+        with:
+          name: source-packages
+
+      - name: Unpack sources
+        run: |
+          ln -s orig/*.orig.* .
+          release_tag=$(sh -c '. /etc/os-release; echo $VERSION_ID' | tr -d . | grep .)
+          dsc_file=$(echo *~ubu${release_tag}u*.dsc)
+          (set -x; dpkg-source --extract $dsc_file chromium-srcpkg) 2>&1
+          echo ' '
+          (set -x; cd chromium-srcpkg && dpkg-parsechangelog -c 1) 2>&1
+
+      - name: Install build dependencies
+        run: |
+          conf=/tmp/apt-yes.conf
+          (echo 'APT::Get::Assume-Yes "true";'; echo 'Dpkg::Use-Pty "false";') > $conf
+          (set -x; APT_CONFIG=$conf mk-build-deps -ir chromium-srcpkg/debian/control) 2>&1
+
+      - name: Perform build
+        env:
+          TIMEOUT: timeout --foreground --verbose --kill-after=30s ${{inputs.test-build-time}}m
+        run: |
+          cd chromium-srcpkg
+          status=0
+          (set -x; $TIMEOUT dpkg-buildpackage -b) 2>&1 || status=$?
+          if [ $status -eq 124 ]
+          then
+            echo 'Partial build result is GOOD'
+          elif [ $status -eq 0 ]
+          then
+            echo 'Huh? Build completed successfully?!'
+            exit 1
+          else
+            echo "Build FAILED with status $status"
+            exit $status
+          fi
+
+  notify-salsa:
+    needs: [test-build]
+    if: inputs.salsa-ref
+    runs-on: ubuntu-latest
+    env:
+      SALSA_REF: ${{inputs.salsa-ref}}
+      TOKEN: ${{secrets.SALSA_CHROMIUM_TOKEN}}
+    steps:
+      - name: Send notification to Salsa chromium repo
+        run: |
+          project_id=84400  # iskunk/chromium-debian
+          echo Doing curl request  # XXX
+          true curl --fail-with-body \
+            --request POST \
+            --form token=$TOKEN \
+            --form ref=master \
+            --form "variables[BASE_REF]=$SALSA_REF" \
+            https://salsa.debian.org/api/v4/projects/$project_id/trigger/pipeline
+
+# EOF
